@@ -29,7 +29,9 @@ def task_check_if_extract(message):
     extraction queue.
     """
     logger.debug('Checking content: %s', message)
-    results = extraction.check_if_extract(message)
+    if not isinstance(message, list):
+        message = [message]
+    results = checker.check_if_extract(message, app.conf['FULLTEXT_EXTRACT_PATH'])
     logger.debug('Results: %s', results)
     if results:
         for key in results:

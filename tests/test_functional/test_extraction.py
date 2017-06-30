@@ -18,21 +18,16 @@ __license__ = 'GPLv3'
 import sys
 import os
 
-PROJECT_HOME = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '../../'))
-sys.path.append(PROJECT_HOME)
-
-import run
 import os
 import time
 import subprocess
 import string
 import unittest
-from lib.test_base import TestGeneric
-from settings import PROJ_HOME, CONSTANTS
+import celery
+from adsft.tests import test_base
+import run
 
-
-class TestExtractWorker(TestGeneric):
+class TestExtractWorker(test_base.TestUnit):
     """
     Class for testing the overall functionality of the ADSfull text pipeline.
     The interaction between the Python workers, Java workers, and the RabbitMQ
@@ -47,20 +42,9 @@ class TestExtractWorker(TestGeneric):
 
         :return: no return
         """
+        super(TestExtractWorker, self).setUp()
         self.expected_folders = []
-        # Start the pipeline
-        try:
-            self.supervisor_ADS_full_text(action='start', pipeline='Group')
-
-        except:
-            print("WARNING: COULD NOT START TESTING PIPELINE")
-            pass
-        # try:
-        #     self.supervisor_ADS_full_text(action='start', pipeline='Java')
-        # except:
-        #     print "WARNING: COULD NOT START JAVA PIPELINE"
-        #     pass
-        time.sleep(3)
+        self._start_pipeline()
 
     def tearDown(self):
         """
@@ -71,23 +55,10 @@ class TestExtractWorker(TestGeneric):
 
         :return: no return
         """
-
-        self.connect_publisher()
-        self.purge_all_queues()
-        self.clean_up_path(self.expected_folders)
-
-        # Stop the pipeline
-        try:
-            self.supervisor_ADS_full_text(action='stop', pipeline='Group')
-
-        except:
-            print("WARNING: COULD NOT STOP TESTING PIPELINE")
-            pass
-        # try:
-        #     self.supervisor_ADS_full_text(action='stop', pipeline='Python')
-        # except:
-        #     print "WARNING: COULD NOT STOP PYTHON PIPELINE"
-        #     pass
+        
+        super(TestExtractWorker, self).tearDown()
+        self._stop_pipeline()
+        
 
     def helper_make_link(self, outfile):
         """
@@ -101,7 +72,7 @@ class TestExtractWorker(TestGeneric):
 
         letter_list = string.ascii_lowercase
         with open(
-                "{home}/{filename}".format(home=PROJ_HOME, filename=outfile),
+                "{home}/{filename}".format(home=self.app.conf['PROJ_HOME'], filename=outfile),
                 'w'
         ) as f_out:
 
@@ -113,7 +84,7 @@ class TestExtractWorker(TestGeneric):
                     'ft{letter}\t'
                     '{home}/tests/test_integration/stub_data/full_test.txt\t'
                     'MNRAS\n'
-                    .format(letter=letter, home=PROJ_HOME)
+                    .format(letter=letter, home=self.app.conf['PROJ_HOME'])
                 )
 
                 letter_list = letter_list[1:]
@@ -123,44 +94,82 @@ class TestExtractWorker(TestGeneric):
                     'ft{letter}\t'
                     '{home}/src/test/resources/test_doc.pdf\t'
                     'MNRAS\n'
-                    .format(letter=letter, home=PROJ_HOME)
+                    .format(letter=letter, home=self.app.conf['PROJ_HOME'])
                 )
+    
+    def _get_rabbitmq_container(self):
+        """Retrieves the docker image of the rabbitmq container; if not available
+        raise error with instructions."""
+        
+        output = subprocess.check_output('docker ps -f name=rabbitmq -q'.split())
+        if not output or len(output) < 10:
+            raise Exception('Cannot find running docker container named: "rabbitmq"' \
+                            "Have you done the following?" \
+                            " git clone https://github.com/adsabs/devtools " \
+                            " cd devtools" \
+                            " vagrant up rabbitmq --provider=docker"
+                            )
+        return output.strip()
+        
+    def _start_pipeline(self):
+        cid = self._get_rabbitmq_container()
+        vhost = self.app.conf['CELERY_BROKER'].split('/')[-1]
+        
+        # create the vhost
+        subprocess.call('docker exec {} rabbitmqctl add_vhost {}'
+                              .format(cid, vhost), shell=True)
+        subprocess.call('docker exec {} rabbitmqctl set_permissions -p {} guest ".*" ".*" ".*"'
+                              .format(cid, vhost), shell=True)
+        
+        # note(rca): I've tried very hard to avoid this concoction but was always thrown back by 
+        # errors down the line; so I settled with the stupid shell command that relies on presence
+        # of virtualenv and bash
+        # 
+        pypath = os.path.dirname(sys.executable)
+        command = 'cd {proj_home} && celery -D -A adsft.tasks worker -b {celery}'.\
+            format(pypath=pypath, celery=self.app.conf['CELERY_BROKER'], proj_home=self.app.conf['PROJ_HOME'])
+        if os.path.exists(pypath + '/activate'):
+            command = 'source {pypath}/activate && '.format(pypath=pypath) + command 
+            
+        print 'executing', command
+        subprocess.check_call(command, shell=True, executable='/bin/bash')
+        # start celery
+        #args = 'celery -A adsft.tasks worker -b {}' \
+        #                      .format(self.app.conf['CELERY_BROKER'], ).split(' ')
+        #print args
+        #cc = CeleryCommand()
+        #super(CeleryCommand, cc).execute_from_commandline(args)
+        
+        #x = self.app.start(argv='celery -D -A adsft.tasks worker -b \'{}\''
+        #                  .format(self.app.conf['CELERY_BROKER'],).split())
+        #subprocess.check_call('{} -m adsft.tasks -D -A adsft.tasks worker -b {}'.
+        #                      format(subprocess.check_output('which python', shell=True).strip(), vhost),
+        #                      shell=True, env=os.environ.copy())
+        #print subprocess.Popen(args, env=os.environ.copy())
+        #print subprocess.check_output(' '.join(args), executable='/bin/bash', 
+        #                              shell=True, env=os.environ.copy())
+        
+    
+    def _stop_pipeline(self):
+        cid = self._get_rabbitmq_container()
+        vhost = self.app.conf['CELERY_BROKER'].split('/')[-1]
+        
+        # stop celery
+        pypath = os.path.dirname(sys.executable)
+        command = 'cd {proj_home} && celery control shutdown -b {celery}'.\
+            format(pypath=pypath, celery=self.app.conf['CELERY_BROKER'], proj_home=self.app.conf['PROJ_HOME'])
+        if os.path.exists(pypath + '/activate'):
+            command = 'source {pypath}/activate && '.format(pypath=pypath) + command 
+            
+        print 'executing', command
+        subprocess.call(command, shell=True, executable='/bin/bash')
+        
+        # delete the vhost
+        subprocess.check_call('docker exec {} rabbitmqctl delete_vhost {}'
+                              .format(cid, vhost), shell=True)
 
-    def supervisor_ADS_full_text(self, action, pipeline):
-        """
-        Helper function that uses subprocess to start/stop the ADSfulltext
-        pipeline using supervisorctl.
 
-        :param action: 'start' or 'stop' the pipeline
-        :param pipeline: supervisorctl group name to start or stop
-        :return: no return
-        """
 
-        pipeline_d = {'Python': 'ADSfulltext',
-                      'Java': 'ADSfulltextPDFLIVE',
-                      'Group': 'GroupADSfulltextTEST:*'}
-
-        accepted_actions = ['stop', 'start']
-        if action not in accepted_actions:
-            print 'You can only use: %s' % accepted_actions
-            return
-
-        process = subprocess.Popen(['supervisorctl',
-                                    '-c',
-                                    '/etc/supervisord.conf',
-                                    action,
-                                    pipeline_d[pipeline]],
-                                   stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-
-        output, error = process.communicate()
-
-        if action not in output:
-            raise Exception(
-                'ADSfull text could not be started correctly, exiting',
-                output,
-                error
-            )
 
     def test_functionality_of_the_system_on_non_existent_files(self):
         """
@@ -179,7 +188,7 @@ class TestExtractWorker(TestGeneric):
         # Expect that the records are split into the correct number of
         # packet sizes
         self.helper_make_link(outfile=full_text_links)
-        run.run(full_text_links=os.path.join(PROJ_HOME, full_text_links),
+        run.run(full_text_links=os.path.join(self.app.conf['PROJ_HOME'], full_text_links),
                 packet_size=10,
                 force_extract=False)
 
